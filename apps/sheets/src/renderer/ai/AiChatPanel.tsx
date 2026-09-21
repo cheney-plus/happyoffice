@@ -233,7 +233,6 @@ export function AiChatPanel({
   scopeLocked,
   onScopeDismiss,
   onCitation,
-  onExpand,
   onCollapse,
 }: {
   readonly isOpen: boolean
@@ -281,7 +280,7 @@ export function AiChatPanel({
   readonly onCitation: (href: string) => void
   readonly onExpand: () => void
   readonly onCollapse: () => void
-}): React.JSX.Element {
+}): React.JSX.Element | null {
   const { t, lang } = useI18n()
   // Panel chrome follows the UI language; message text follows its own content (dir=auto below)
   const isRtl = lang === 'ar' || lang === 'he'
@@ -437,18 +436,8 @@ export function AiChatPanel({
   }
 
   if (!isOpen) {
-    return (
-      <aside className="copilot collapsed">
-        <button
-          className="expand-copilot"
-          onClick={onExpand}
-          data-tip={t('aiOpenAssistant')}
-          aria-label={t('aiOpenAssistant')}
-        >
-          <GensparkMark size={22} />
-        </button>
-      </aside>
-    )
+    // collapsed: render nothing (reopen via the ribbon AI toggle)
+    return null
   }
 
   const canSend = prompt.trim().length > 0 && !aiBusy

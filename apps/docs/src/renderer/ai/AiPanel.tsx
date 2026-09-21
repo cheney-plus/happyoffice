@@ -328,7 +328,6 @@ export function AiPanel({
   numIdFallback,
   preset,
   open = true,
-  onExpand,
   onCollapse,
   filePath,
   editQueue = [],
@@ -1240,18 +1239,10 @@ export function AiPanel({
     resizer.setPointerCapture(e.pointerId)
   }
 
-  // collapsed: rail only — after all hooks, so the instance and its state survive
+  // collapsed: render nothing (reopen via the ribbon AI toggle) — after all hooks,
+  // so the instance and its state survive
   if (!open) {
-    return (
-      <button
-        className="ai-rail"
-        data-tip={t('appExpandAiPanel')}
-        aria-label={t('appExpandAiPanel')}
-        onClick={onExpand}
-      >
-        <GensparkMark size={22} />
-      </button>
-    )
+    return null
   }
 
   return (

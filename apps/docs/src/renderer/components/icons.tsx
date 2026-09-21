@@ -1,5 +1,6 @@
 /** Small monochrome SVG icons approximating Word's ribbon glyphs. */
 
+import fridayIcon from '../assets/friday-icon.png'
 import type { ReactNode } from 'react'
 
 interface IconProps {
@@ -1746,20 +1747,13 @@ export function IconClose(props: IconProps) {
  * crisply at device resolution instead of going through <img> rasterization */
 export function GensparkMark({ size = 30 }: { size?: number }) {
   return (
-    <svg
+    <img
+      src={fridayIcon}
       width={size}
       height={size}
-      viewBox="0 0 130 130.025"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
+      alt=""
       aria-hidden
-    >
-      <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M28 0H102C117.464 0 130 12.536 130 28V102C130 117.464 117.464 130 102 130H28C12.536 130 0 117.464 0 102V28C0 12.536 12.536 0 28 0ZM40 32H90V48H56V60H84V76H56V98H40Z"
-        fill="currentColor"
-      />
-    </svg>
+      style={{ display: 'block', borderRadius: '18%' }}
+    />
   )
 }

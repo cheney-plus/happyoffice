@@ -1618,7 +1618,7 @@ button.check-item:hover {
 }
 
 .app-shell.copilot-collapsed .sheet-body {
-  grid-template-columns: 34px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .sheet-main {

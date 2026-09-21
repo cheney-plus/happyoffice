@@ -10918,7 +10918,7 @@ tr > .page-gap-cut {
 }
 
 .ai-dock.collapsed {
-  width: 34px;
+  width: 0;
 }
 
 /* while dragging the resizer, follow the pointer without easing */

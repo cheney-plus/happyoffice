@@ -6743,16 +6743,6 @@ export default function App() {
         {/* dock wrapper animates the width between panel and rail (docs-style 180ms ease);
             the panel stays mounted while collapsed so the chat history survives */}
         <div className={`ai-dock${aiCollapsed ? ' collapsed' : ''}`}>
-          {aiCollapsed && (
-            <button
-              className="ai-rail"
-              data-tip={t('aiOpenAssistant')}
-              aria-label={t('aiOpenAssistant')}
-              onClick={() => setAiCollapsed(false)}
-            >
-              <GensparkMark size={22} />
-            </button>
-          )}
           <AiPanel
             api={aiApi}
             filePath={filePath}

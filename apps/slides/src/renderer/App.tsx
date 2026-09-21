@@ -3280,16 +3280,7 @@ export function App() {
                   setEditQueue((prev) => prev.filter((it) => !keys.includes(it.key)))
                 }
               />
-            ) : (
-              <button
-                className="ai-rail"
-                onClick={toggleAi}
-                data-tip={t('appAiRailExpand')}
-                aria-label={t('appAiRailExpand')}
-              >
-                <GensparkMark size={22} />
-              </button>
-            )}
+            ) : null}
           </div>
         )}
         <div className="app-content">
