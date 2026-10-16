@@ -110,6 +110,12 @@ const PARA_CHAR_BUDGET = 4000
 
 const MEASURE_RETRY_MAX = 10
 const MEASURE_SIGS_MAX = 12
+/** duty cycle for measuring the mounted prefix while a streamed tail lands */
+const STREAM_MEASURE_GAP_MS = 900
+/** fresh per-paragraph measurements per pass: bounds every pass to a slice of
+ *  the document, so no single task pays a full-document re-measure (the tail
+ *  between the last duty window and the end of the stream would otherwise) */
+const STREAM_FRESH_BUDGET = 220
 
 export interface CjkPunctShrinkStorage {
   /** settings.xml characterSpacingControl compresses punctuation */
@@ -356,6 +362,10 @@ class CjkPunctShrinkView {
   private frozen = false
   private retryRaf = 0
   private retries = 0
+  /** constructor-set: the first duty claim waits one window past the mount */
+  private streamMeasureAt = performance.now()
+  private catchupTimer: ReturnType<typeof setTimeout> | undefined
+  private inCatchup = false
   private resizeObserver?: ResizeObserver
   private lastDomWidth = -1
   private onFontsLoaded = () => {
@@ -370,8 +380,32 @@ class CjkPunctShrinkView {
     this.measure()
   }
   private onPhasedSettled = () => {
-    this.invalidate()
+    // no invalidate: streaming-time results are per-paragraph and stay valid —
+    // a clear would re-walk the whole document synchronously (a multi-second
+    // freeze on large documents)
     this.measure()
+  }
+
+  /** once per duty-cycle window while a streamed tail is landing */
+  private claimStreamMeasure(): boolean {
+    const now = performance.now()
+    if (now - this.streamMeasureAt < STREAM_MEASURE_GAP_MS) return false
+    this.streamMeasureAt = now
+    return true
+  }
+
+  /** continue a truncated progressive measurement outside the current task */
+  private scheduleCatchup() {
+    if (this.catchupTimer) return
+    this.catchupTimer = setTimeout(() => {
+      this.catchupTimer = undefined
+      this.inCatchup = true
+      try {
+        this.measure()
+      } finally {
+        this.inCatchup = false
+      }
+    }, 30)
   }
 
   constructor(
@@ -424,6 +458,7 @@ class CjkPunctShrinkView {
     document.removeEventListener(PHASED_CONTENT_SETTLED_EVENT, this.onPhasedSettled)
     this.resizeObserver?.disconnect()
     if (this.retryRaf) cancelAnimationFrame(this.retryRaf)
+    if (this.catchupTimer) clearTimeout(this.catchupTimer)
   }
 
   private scheduleRetry() {
@@ -441,8 +476,11 @@ class CjkPunctShrinkView {
       this.retryRaf = 0
     }
     const { view } = this
-    // a streamed tail is still landing: measured once, when it has (settled event)
-    if (isPhasedContentPending()) return
+    // a streamed tail is still landing: measure the mounted prefix on a duty
+    // cycle (per-chunk measurement would force a layout per chunk), so the
+    // settled event only confirms the last chunks on a warm cache. Catch-up
+    // rounds continue a truncated pass regardless of the duty window.
+    if (isPhasedContentPending() && !this.inCatchup && !this.claimStreamMeasure()) return
     // PDF export parks the editor subtree (.app.pv-exporting); any layout
     // read here would force the parked document to re-lay out per print chunk
     if (view.dom.closest('.app.pv-exporting')) {
@@ -474,6 +512,8 @@ class CjkPunctShrinkView {
 
     const shrinks: MeasuredShrink[] = []
     let measurable = paras.length === 0
+    let freshBudget = STREAM_FRESH_BUDGET
+    let truncated = false
     this.results.beginPass(view)
     const topLevel = SettledParagraphCache.topLevelDom(view)
     for (const para of paras) {
@@ -481,7 +521,14 @@ class CjkPunctShrinkView {
         view,
         para.node,
         para.pos,
-        (el) => this.measureParagraph(para.node, para.pos, el),
+        (el) => {
+          if (freshBudget <= 0) {
+            truncated = true
+            return null
+          }
+          freshBudget--
+          return this.measureParagraph(para.node, para.pos, el)
+        },
         topLevel.get(para.node),
       )
       if (!measured) continue
@@ -493,6 +540,15 @@ class CjkPunctShrinkView {
       return
     }
     this.retries = 0
+    if (truncated) {
+      // progressive measurement: more paragraphs are waiting, so decorations
+      // will change again next slice — the oscillation guard does not apply
+      // (each slice legitimately differs); continue on a timer, bounded
+      this.seenSigs.clear()
+      this.frozen = false
+      this.scheduleCatchup()
+      return
+    }
 
     const sig = JSON.stringify(shrinks.map((s) => [s.from, s.perChar, s.baseLs]))
     if (sig === this.lastSig) return

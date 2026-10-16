@@ -419,6 +419,8 @@ const MEASURE_RETRY_MAX = 10
  * tab-heavy government forms: the renderer hangs at 100% CPU).
  */
 const MEASURE_SIGS_MAX = 8
+/** duty cycle for measuring the mounted prefix while a streamed tail lands */
+const STREAM_MEASURE_GAP_MS = 900
 
 class TabLayoutView {
   private lastSig = ''
@@ -426,6 +428,7 @@ class TabLayoutView {
   private frozen = false
   private retryRaf = 0
   private retries = 0
+  private streamMeasureAt = 0
   private resizeObserver?: ResizeObserver
   private lastDomWidth = -1
   // font swaps change text metrics, which shifts every tab's start x
@@ -434,8 +437,18 @@ class TabLayoutView {
     this.measure()
   }
   private onPhasedSettled = () => {
-    this.invalidate()
+    // no invalidate: streaming-time results are per-paragraph and stay valid —
+    // a clear would re-walk the whole document synchronously (a multi-second
+    // freeze on large documents)
     this.measure()
+  }
+
+  /** once per duty-cycle window while a streamed tail is landing */
+  private claimStreamMeasure(): boolean {
+    const now = performance.now()
+    if (now - this.streamMeasureAt < STREAM_MEASURE_GAP_MS) return false
+    this.streamMeasureAt = now
+    return true
   }
 
   constructor(
@@ -500,8 +513,10 @@ class TabLayoutView {
       this.retryRaf = 0
     }
     const { view } = this
-    // a streamed tail is still landing: measured once, when it has (settled event)
-    if (isPhasedContentPending()) return
+    // a streamed tail is still landing: measure the mounted prefix on a duty
+    // cycle (per-chunk measurement would force a layout per chunk), so the
+    // settled event only confirms the last chunks on a warm cache
+    if (isPhasedContentPending() && !this.claimStreamMeasure()) return
     if (!view.dom.isConnected) {
       this.scheduleRetry()
       return

@@ -283,11 +283,20 @@ export function probeColWrap(
  */
 const lineSampleCache = new WeakMap<
   HTMLElement,
-  { sig: string; boundaries?: number[]; rows?: TableRowBox[]; soleLineBottom?: number }
+  {
+    sig: string
+    epoch: number
+    boundaries?: number[]
+    rows?: TableRowBox[]
+    soleLineBottom?: number
+  }
 >()
 
 // webfont loads shift line boxes without changing block height (explicit line
-// heights), so the geometry/content signature alone cannot see them
+// heights), so the geometry/content signature alone cannot see them. An epoch
+// bump only means metrics MAY have moved: entries re-verified against the fresh
+// measurement (the signature carries text/width/height/descendants) stay valid,
+// so a font load re-samples just the blocks it actually moved.
 let lineSampleFontEpoch = 0
 
 export function bumpLineSampleFontEpoch(): void {
@@ -311,7 +320,7 @@ function lineSampleSig(el: HTMLElement, textH: number): string {
     const per = Math.round((parseFloat(sp.style.wordSpacing) || 0) * -100)
     js = (js * 33 + per + (sp.textContent?.length ?? 0)) | 0
   }
-  return `${lineSampleFontEpoch}:${Math.round(textH * 4)}:${Math.round(w * 4)}:${nodes}:${h}:${js}`
+  return `${Math.round(textH * 4)}:${Math.round(w * 4)}:${nodes}:${h}:${js}`
 }
 
 export function fillLineBoxes(
@@ -405,14 +414,24 @@ export function fillLineBoxes(
       (block.footnoteExtraPx ?? 0)
     const sig = lineSampleSig(block.el, textH)
     const cached = lineSampleCache.get(block.el)
-    const hit = cached?.sig === sig ? cached : null
+    let hit = cached?.sig === sig ? cached : null
+    if (hit && hit.epoch !== lineSampleFontEpoch) {
+      // stale epoch: the signature (fresh this pass) already saw text, width,
+      // descendant count and the block height, and text blocks tile at uniform
+      // line boxes under explicit line heights — equal height keeps the sampled
+      // boundaries valid. Table row distribution can shift while the total
+      // stays equal, so tables re-sample.
+      if (block.el.querySelector('tr')) hit = null
+      else hit.epoch = lineSampleFontEpoch
+    }
 
     if (block.el.querySelector('tr')) {
       // flags mutate the rows, so cached rows are cloned per use
       const rows = hit?.rows
         ? hit.rows.map((r) => ({ ...r }))
         : domTableRows(block.el, textH, zoomFactor)
-      if (!hit?.rows) lineSampleCache.set(block.el, { sig, rows: rows.map((r) => ({ ...r })) })
+      if (!hit?.rows)
+        lineSampleCache.set(block.el, { sig, epoch: lineSampleFontEpoch, rows: rows.map((r) => ({ ...r })) })
       if (rows.length > 0) {
         const flags =
           block.docxIndex !== undefined ? metaOf?.(block.docxIndex)?.tableRowFlags : undefined
@@ -446,6 +465,7 @@ export function fillLineBoxes(
       soleLineBottom = lines.length === 1 ? lines[0].bottom : undefined
       lineSampleCache.set(block.el, {
         sig,
+        epoch: lineSampleFontEpoch,
         boundaries: [...boundaries],
         ...(soleLineBottom !== undefined ? { soleLineBottom } : {}),
       })

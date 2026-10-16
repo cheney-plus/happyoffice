@@ -21,6 +21,172 @@ export function anchorShiftPx(el: HTMLElement): number {
   return parseFloat(el.dataset.anchorDy ?? '') || 0
 }
 
+/** Scan-derived geometry of one top-level block, cached by element identity.
+ *  Repagination re-measures a mostly unchanged document (streaming tail, edits,
+ *  font epochs) and the per-block DOM scans (break queries, range text probes,
+ *  computed styles) dominate that repeated cost. ProseMirror reuses the DOM for
+ *  unchanged content, so entries are keyed on the element and drop with it
+ *  (WeakMap); the fingerprint carries the freshly measured rect, so any
+ *  layout-visible change misses and re-scans. */
+type BlockGeom = {
+  /** net flow height, zoom-normalized: rect height minus in-block inline gaps */
+  height: number
+  /** total in-block inline gap height (screen px) */
+  innerGap: number
+  /** Y of each post-break line's ink top, element-relative, zoom-normalized */
+  innerBreaks: number[]
+  hasBreak: boolean
+  hasColBreak: boolean
+  hasText: boolean
+  leadingCount: number
+  trailingCount: number
+  leadingCut: boolean
+  leadingColBreak: boolean
+  /** break-only paragraph's fit height (one line's share), zoom-normalized */
+  breakOnlyLineH?: number
+  emptyPara: boolean
+  /** non-reflowable block keeps its rendered width in any column */
+  fixedWidth: boolean
+}
+
+const blockGeomCache = new WeakMap<HTMLElement, { fp: string; g: BlockGeom }>()
+
+/** Fingerprint of everything the scan-derived geometry depends on, checked
+ *  against the freshly measured rect: text, classes, inline style, structure,
+ *  width (covers zoom and column width) and height (covers any font-metric
+ *  or formatting drift that changed the layout). */
+function blockFingerprint(el: HTMLElement, rect: DOMRect): string {
+  const text = el.textContent ?? ''
+  let h = 5381
+  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0
+  return `${h}|${el.className}|${el.style.cssText}|${el.childElementCount}|${Math.round(rect.width * 4)}|${Math.round(rect.height * 4)}`
+}
+
+function scanBlockGeom(el: HTMLElement, rect: DOMRect, zoomFactor: number): BlockGeom {
+  // Word ignores page-type w:br inside table cells, and breaks inside a
+  // textbox lay out that box's own text — neither may break the body flow
+  const breakEls = Array.from(el.querySelectorAll('.doc-field-pagebreak, .doc-page-br')).filter(
+    (b) => !b.closest('td, th, .doc-textbox'),
+  )
+  const hasBreak = breakEls.length > 0
+  const colBreakEls = Array.from(el.querySelectorAll('.doc-col-br')).filter(
+    (b) => !b.closest('td, th, .doc-textbox'),
+  )
+  const hasColBreak = colBreakEls.length > 0
+  // in-block gaps from mid-paragraph page breaks: subtract from block height and add to the gap accumulator for later blocks
+  const innerGap = innerGapHeight(el)
+  const height = (rect.height - innerGap) / zoomFactor
+  // break-only paragraph (br line + ProseMirror trailing-break phantom line): marked
+  // for dedicated placement — Word pushes it into a deliberate blank page when its
+  // line doesn't fit at the page bottom. Word renders a single break line, but the
+  // DOM height spans one line box per <br> (a text-less paragraph lays out exactly
+  // brCount line boxes), so the fit height is one line's share. Word only charges
+  // the line's natural single-spacing extent at the page bottom (probe 20260901: a
+  // double-spaced Calibri 11pt break line absorbs at 14pt remaining, while an exact
+  // line demands its full exact height), so auto multiples above 1 are divided out.
+  const emptyPara = !(el.textContent ?? '').trim() && !el.querySelector('img')
+  const breakOnly = hasBreak && emptyPara
+  const brLines = breakOnly ? el.querySelectorAll('br').length : 0
+  let breakOnlyLineH: number | undefined
+  if (breakOnly) {
+    const box = brLines > 1 ? height / brLines : height
+    // per-paragraph declarations live in the inline style; the document-level
+    // multiple cascades through the computed style. Fixed-height lines demand
+    // their full box: direct exact/atLeast carries the doc-lh-fixed class, a
+    // style-level exact/atLeast is marked by --doc-line-fixed (doc-style-css)
+    // — unless a direct auto override re-declares the inline multiple.
+    const inlineMult = el.style.getPropertyValue('--doc-line-mult')
+    const fixed =
+      el.classList.contains('doc-lh-fixed') ||
+      (!inlineMult &&
+        (
+          el.style.getPropertyValue('--doc-line-fixed') ||
+          getComputedStyle(el).getPropertyValue('--doc-line-fixed')
+        ).trim() === '1')
+    const mult = fixed
+      ? 1
+      : parseFloat(inlineMult || getComputedStyle(el).getPropertyValue('--doc-line-mult')) || 1
+    breakOnlyLineH = box / Math.max(1, mult)
+  }
+  // breaks with no text before them lead the block: the break line stays on
+  // the current page and the block's text starts the next one (Word), so the
+  // last leading break cuts like a mid-paragraph break; a field break has no
+  // line of its own and maps to breakBefore. Breaks with no text after it
+  // trail (breakAfter pushes the next block). Every break character turns the
+  // page, so a run of N adjacent breaks leaves N-1 blank sheets. Text is
+  // measured outside the break nodes (a field break carries its own label).
+  let hasText = false
+  let leadingCount = 0
+  let trailingCount = 0
+  let leadingCut = false
+  // a column break with nothing before it moves the whole paragraph (its own
+  // line included) to the next column top; a break-only paragraph likewise
+  let leadingColBreak = false
+  if (colBreakEls.length === 1) {
+    const r = document.createRange()
+    r.setStart(el, 0)
+    r.setEndBefore(colBreakEls[0])
+    leadingColBreak = !r.toString().trim()
+  }
+  // breaks with text on both sides split the paragraph across the page turn
+  // (Word keeps the text before on this page); only a trailing break pushes
+  // the next block. Y = the post-break line's ink top, element-relative and
+  // net of inline gaps a previous pass already inserted there
+  const innerBreaks: number[] = []
+  if (hasBreak) {
+    const gapRects = Array.from(el.querySelectorAll('.page-gap-inline')).map((g) =>
+      g.getBoundingClientRect(),
+    )
+    const gapAbove = (y: number) => gapRects.reduce((s, g) => (g.top <= y ? s + g.height : s), 0)
+    const r = document.createRange()
+    const brs = breakEls.map((b) => {
+      r.setStart(el, 0)
+      r.setEndBefore(b)
+      const before = r.toString().trim() !== ''
+      r.setStartAfter(b)
+      r.setEnd(el, el.childNodes.length)
+      const after = r.toString().trim() !== ''
+      return { b, before, after }
+    })
+    hasText = brs.some((x) => x.before || x.after)
+    leadingCount = brs.filter((x) => !x.before).length
+    trailingCount = brs.filter((x) => !x.after).length
+    brs.forEach(({ b, before, after }, i) => {
+      if (!after || !b.classList.contains('doc-page-br')) return
+      if (!before && i !== leadingCount - 1) return
+      r.setStartAfter(b)
+      r.setEnd(el, el.childNodes.length)
+      const first = Array.from(r.getClientRects?.() ?? []).find(
+        (c) => c.height > 0 && c.width > 0,
+      )
+      if (!first) return
+      innerBreaks.push((first.top - rect.top - gapAbove(first.top)) / zoomFactor)
+      if (!before) leadingCut = true
+    })
+  }
+  // non-reflowable blocks keep their rendered width in any column (tables,
+  // anchored/inline textbox shapes; protected text paragraphs still reflow)
+  const fixedWidth =
+    el.tagName === 'TABLE' ||
+    el.classList.contains('doc-protected-textboxes') ||
+    !!el.querySelector('table')
+  return {
+    height,
+    innerGap,
+    innerBreaks,
+    hasBreak,
+    hasColBreak,
+    hasText,
+    leadingCount,
+    trailingCount,
+    leadingCut,
+    leadingColBreak,
+    ...(breakOnlyLineH !== undefined ? { breakOnlyLineH } : {}),
+    emptyPara,
+    fixedWidth,
+  }
+}
+
 export function measureBlocks(
   pm: HTMLElement,
   origin: number,
@@ -98,112 +264,23 @@ export function measureBlocks(
       if (idx) sectBreaks.add(parseInt(idx, 10))
       continue
     }
-    // Word ignores page-type w:br inside table cells, and breaks inside a
-    // textbox lay out that box's own text — neither may break the body flow
-    const breakEls = Array.from(el.querySelectorAll('.doc-field-pagebreak, .doc-page-br')).filter(
-      (b) => !b.closest('td, th, .doc-textbox'),
-    )
-    const hasBreak = breakEls.length > 0
-    const colBreakEls = Array.from(el.querySelectorAll('.doc-col-br')).filter(
-      (b) => !b.closest('td, th, .doc-textbox'),
-    )
-    const hasColBreak = colBreakEls.length > 0
+    // scan-derived geometry, cached while the element's fingerprint (fresh
+    // rect, text, classes, inline style, structure) matches: repagination
+    // re-runs this loop on a mostly unchanged document and the per-block
+    // scans (break queries, range probes, computed styles) dominate the
+    // repeat cost
+    const fp = blockFingerprint(el, rect)
+    const cachedGeom = blockGeomCache.get(el)
+    const geom = cachedGeom?.fp === fp ? cachedGeom.g : scanBlockGeom(el, rect, zoomFactor)
+    if (!cachedGeom || cachedGeom.fp !== fp) blockGeomCache.set(el, { fp, g: geom })
+    const { hasBreak } = geom
     // zero-height blocks are skipped, except a break carrier (e.g. a floating
     // textbox whose anchor paragraph holds a page-type w:br) must still be seen
     if (rect.height <= 0 && !hasBreak) continue
-    // in-block gaps from mid-paragraph page breaks: subtract from block height and add to the gap accumulator for later blocks
-    const innerGap = innerGapHeight(el)
     const top = (rect.top - anchorShiftPx(el) * zoomFactor - origin - gapAccum) / zoomFactor
-    const height = (rect.height - innerGap) / zoomFactor
+    const height = geom.height
     const idxAttr = el.getAttribute('data-idx')
-    // break-only paragraph (br line + ProseMirror trailing-break phantom line): marked
-    // for dedicated placement — Word pushes it into a deliberate blank page when its
-    // line doesn't fit at the page bottom. Word renders a single break line, but the
-    // DOM height spans one line box per <br> (a text-less paragraph lays out exactly
-    // brCount line boxes), so the fit height is one line's share. Word only charges
-    // the line's natural single-spacing extent at the page bottom (probe 20260901: a
-    // double-spaced Calibri 11pt break line absorbs at 14pt remaining, while an exact
-    // line demands its full exact height), so auto multiples above 1 are divided out.
-    const breakOnly = hasBreak && !(el.textContent ?? '').trim() && !el.querySelector('img')
-    const brLines = breakOnly ? el.querySelectorAll('br').length : 0
-    let breakOnlyLineH: number | undefined
-    if (breakOnly) {
-      const box = brLines > 1 ? height / brLines : height
-      // per-paragraph declarations live in the inline style; the document-level
-      // multiple cascades through the computed style. Fixed-height lines demand
-      // their full box: direct exact/atLeast carries the doc-lh-fixed class, a
-      // style-level exact/atLeast is marked by --doc-line-fixed (doc-style-css)
-      // — unless a direct auto override re-declares the inline multiple.
-      const inlineMult = el.style.getPropertyValue('--doc-line-mult')
-      const fixed =
-        el.classList.contains('doc-lh-fixed') ||
-        (!inlineMult &&
-          (
-            el.style.getPropertyValue('--doc-line-fixed') ||
-            getComputedStyle(el).getPropertyValue('--doc-line-fixed')
-          ).trim() === '1')
-      const mult = fixed
-        ? 1
-        : parseFloat(inlineMult || getComputedStyle(el).getPropertyValue('--doc-line-mult')) || 1
-      breakOnlyLineH = box / Math.max(1, mult)
-    }
-    // breaks with no text before them lead the block: the break line stays on
-    // the current page and the block's text starts the next one (Word), so the
-    // last leading break cuts like a mid-paragraph break; a field break has no
-    // line of its own and maps to breakBefore. Breaks with no text after it
-    // trail (breakAfter pushes the next block). Every break character turns the
-    // page, so a run of N adjacent breaks leaves N-1 blank sheets. Text is
-    // measured outside the break nodes (a field break carries its own label).
-    let hasText = false
-    let leadingCount = 0
-    let trailingCount = 0
-    let leadingCut = false
-    // a column break with nothing before it moves the whole paragraph (its own
-    // line included) to the next column top; a break-only paragraph likewise
-    let leadingColBreak = false
-    if (colBreakEls.length === 1) {
-      const r = document.createRange()
-      r.setStart(el, 0)
-      r.setEndBefore(colBreakEls[0])
-      leadingColBreak = !r.toString().trim()
-    }
-    // breaks with text on both sides split the paragraph across the page turn
-    // (Word keeps the text before on this page); only a trailing break pushes
-    // the next block. Y = the post-break line's ink top, element-relative and
-    // net of inline gaps a previous pass already inserted there
-    const innerBreaks: number[] = []
-    if (hasBreak) {
-      const gapRects = Array.from(el.querySelectorAll('.page-gap-inline')).map((g) =>
-        g.getBoundingClientRect(),
-      )
-      const gapAbove = (y: number) => gapRects.reduce((s, g) => (g.top <= y ? s + g.height : s), 0)
-      const r = document.createRange()
-      const brs = breakEls.map((b) => {
-        r.setStart(el, 0)
-        r.setEndBefore(b)
-        const before = r.toString().trim() !== ''
-        r.setStartAfter(b)
-        r.setEnd(el, el.childNodes.length)
-        const after = r.toString().trim() !== ''
-        return { b, before, after }
-      })
-      hasText = brs.some((x) => x.before || x.after)
-      leadingCount = brs.filter((x) => !x.before).length
-      trailingCount = brs.filter((x) => !x.after).length
-      brs.forEach(({ b, before, after }, i) => {
-        if (!after || !b.classList.contains('doc-page-br')) return
-        if (!before && i !== leadingCount - 1) return
-        r.setStartAfter(b)
-        r.setEnd(el, el.childNodes.length)
-        const first = Array.from(r.getClientRects?.() ?? []).find(
-          (c) => c.height > 0 && c.width > 0,
-        )
-        if (!first) return
-        innerBreaks.push((first.top - rect.top - gapAbove(first.top)) / zoomFactor)
-        if (!before) leadingCut = true
-      })
-    }
-    const leadingBreak = hasText && leadingCount > 0 && !leadingCut
+    const leadingBreak = geom.hasText && geom.leadingCount > 0 && !geom.leadingCut
     const floatTable =
       el.classList.contains('doc-table-float-left') ||
       el.classList.contains('doc-table-float-right')
@@ -219,13 +296,9 @@ export function measureBlocks(
     const relVAnchor = el.dataset.tblpVanchor
     const relVSpec = el.dataset.tblpVspec
     const relVApplied = Number.isFinite(relVy) ? parseFloat(el.dataset.tblpDy ?? '') || 0 : 0
-    const emptyPara = !(el.textContent ?? '').trim() && !el.querySelector('img')
     // non-reflowable blocks keep their rendered width in any column (tables,
     // anchored/inline textbox shapes; protected text paragraphs still reflow)
-    const fixedWidth =
-      el.tagName === 'TABLE' ||
-      el.classList.contains('doc-protected-textboxes') ||
-      !!el.querySelector('table')
+    const fixedWidth = geom.fixedWidth
     const bandKeep = el.dataset.bandKeep === '1' && el.classList.contains('doc-protected-floating')
     const liftPx = parseFloat(el.dataset.tblpLift ?? '')
     blocks.push({
@@ -246,28 +319,28 @@ export function measureBlocks(
               : {}),
           }
         : {}),
-      ...(emptyPara ? { emptyPara: true } : {}),
+      ...(geom.emptyPara ? { emptyPara: true } : {}),
       ...(fixedWidth
         ? { fixedWidthPx: rect.width / zoomFactor }
         : { widthPx: rect.width / zoomFactor }),
       breakBefore: el.classList.contains('page-break-before') || leadingBreak || undefined,
       breakBeforeBr: leadingBreak || undefined,
-      ...(hasText && leadingCount > 1 ? { extraBreaksBefore: leadingCount - 1 } : {}),
-      breakAfter: trailingCount > 0 || undefined,
-      ...(trailingCount > 1 ? { extraBreaksAfter: trailingCount - 1 } : {}),
-      ...(innerBreaks.length > 0 ? { innerBreaks } : {}),
-      colBreakBefore: leadingColBreak || undefined,
-      colBreakAfter: (hasColBreak && !leadingColBreak) || undefined,
+      ...(geom.hasText && geom.leadingCount > 1 ? { extraBreaksBefore: geom.leadingCount - 1 } : {}),
+      breakAfter: geom.trailingCount > 0 || undefined,
+      ...(geom.trailingCount > 1 ? { extraBreaksAfter: geom.trailingCount - 1 } : {}),
+      ...(geom.innerBreaks.length > 0 ? { innerBreaks: geom.innerBreaks } : {}),
+      colBreakBefore: geom.leadingColBreak || undefined,
+      colBreakAfter: (geom.hasColBreak && !geom.leadingColBreak) || undefined,
       breakForce: (hasBreak && rect.height <= 0) || undefined,
       el,
-      ...(breakOnlyLineH !== undefined ? { breakOnlyLineH } : {}),
+      ...(geom.breakOnlyLineH !== undefined ? { breakOnlyLineH: geom.breakOnlyLineH } : {}),
       ...(idxAttr ? { docxIndex: parseInt(idxAttr, 10) } : {}),
       ...(carryApplied > 0 ? { carryAppliedPx: carryApplied } : {}),
     })
     carryApplied = 0
     // a CSS float's in-table gaps grow only the float's own box: the blocks
     // after it stack where they would without them
-    if (!floated) gapAccum += innerGap
+    if (!floated) gapAccum += geom.innerGap
     totalHeight = Math.max(totalHeight, top + height)
   }
   // inter-block CSS margin (space after): rect height excludes it, but it occupies

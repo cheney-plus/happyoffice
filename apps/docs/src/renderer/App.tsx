@@ -4219,6 +4219,16 @@ export function App() {
           gapsBuildMs: tGapsBuild,
           setGapsMs: tSetGaps,
         }
+        const dbgPeak = (window as unknown as Record<string, Record<string, unknown>>).__pageDebugPeak ?? {}
+        ;(window as unknown as Record<string, Record<string, unknown>>).__pageDebugPeak = dbgPeak
+        const ms = performance.now() - tStart
+        if (ms > ((dbgPeak.remeasureMsMax as number) ?? 0)) {
+          dbgPeak.remeasureMsMax = ms
+          dbgPeak.measureMsAtMax = tMeasure
+          dbgPeak.sliceMsAtMax = tSlice
+          dbgPeak.gapsBuildMsAtMax = tGapsBuild
+          dbgPeak.setGapsMsAtMax = tSetGaps
+        }
         requestAnimationFrame(() => {
           const tf = performance.now()
           requestAnimationFrame(() => {
