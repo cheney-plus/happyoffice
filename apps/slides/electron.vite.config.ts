@@ -1,9 +1,23 @@
-import { dirname, resolve } from 'node:path'
+import { createRequire } from 'node:module'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import react from '@vitejs/plugin-react'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 
 const here = dirname(fileURLToPath(import.meta.url))
+
+// harfbuzzjs ≥1.x seals its subpaths behind the exports map, and the raw
+// Emscripten factory (dist/harfbuzz.js) must be bundled directly — the public
+// entry has a top-level await that cannot go into the CJS main bundle. Which
+// copy npm hoists where is not stable (root vs apps/slides/node_modules), so
+// resolve it through Node from this app's directory instead of hardcoding a
+// relative node_modules path.
+const slidesRequire = createRequire(join(here, 'src/main/index.ts'))
+const harfbuzzDist = dirname(slidesRequire.resolve('harfbuzzjs', { paths: [join(here, 'src/main')] }))
+const harfbuzzAlias = {
+  'harfbuzzjs/dist/harfbuzz.js': join(harfbuzzDist, 'harfbuzz.js'),
+  'harfbuzzjs/dist/harfbuzz.wasm': join(harfbuzzDist, 'harfbuzz.wasm'),
+}
 
 // Pin resolution to this repo's workspace sources (matches tsconfig paths;
 // avoids bundling stale implementations when node_modules links point elsewhere)
@@ -47,7 +61,7 @@ export default defineConfig({
   // source with extensionless relative imports; externalizing them under Node
   // yields ERR_MODULE_NOT_FOUND).
   main: {
-    resolve: { alias: workspaceAlias },
+    resolve: { alias: { ...workspaceAlias, ...harfbuzzAlias } },
     // Bundle opentype.js too (the packaged app ships only out/**, so external deps are unresolvable at runtime)
     plugins: [
       externalizeDepsPlugin({
@@ -60,6 +74,10 @@ export default defineConfig({
           '@genoffice/file-parse',
           '@genoffice/electron-utils',
           'opentype.js',
+          // must bundle the raw Emscripten factory via the harfbuzzAlias below;
+          // externalizing it would emit require('harfbuzzjs/dist/...') which the
+          // exports map seals and the packaged app (no node_modules) cannot serve
+          'harfbuzzjs',
         ],
       }),
     ],

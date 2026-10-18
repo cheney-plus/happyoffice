@@ -28,7 +28,31 @@
 
 const { execFileSync } = require('node:child_process')
 const { existsSync, rmSync } = require('node:fs')
-const { join } = require('node:path')
+const { createRequire } = require('node:module')
+const { dirname, join } = require('node:path')
+
+// harfbuzzjs for apps/pdf may be hoisted to the workspace root or nested under
+// apps/pdf/node_modules depending on npm hoisting — resolve it through Node
+// from the pdf package directory instead of hardcoding a node_modules path.
+function resolvePdfHarfbuzzWasm() {
+  const req = createRequire(join(__dirname, '../pdf/package.json'))
+  const candidates = [
+    // harfbuzzjs ≤0.10 ships hb-subset.wasm at the package root with no exports map
+    () => req.resolve('harfbuzzjs/hb-subset.wasm'),
+    // harfbuzzjs ≥1.x seals subpaths; the wasm sits next to the exported entry point
+    () => join(dirname(req.resolve('harfbuzzjs')), 'harfbuzz-subset.wasm'),
+  ]
+  for (const candidate of candidates) {
+    try {
+      const p = candidate()
+      if (existsSync(p)) return p
+    } catch {
+      /* try the next shape */
+    }
+  }
+  throw new Error('harfbuzzjs wasm not found for apps/pdf (npm hoisting changed?)')
+}
+const pdfHarfbuzzWasm = resolvePdfHarfbuzzWasm()
 
 function normalizeHttpsBaseUrl(name, value) {
   if (!value || !value.trim()) return null
@@ -92,13 +116,18 @@ for (const rel of [
   '../../node_modules/ws',
   '../../node_modules/electron/dist/LICENSES.chromium.html',
   '../../node_modules/@embedpdf/pdfium/dist/pdfium.wasm',
-  '../pdf/node_modules/harfbuzzjs/hb-subset.wasm',
 ]) {
   if (!existsSync(join(__dirname, rel))) {
     throw new Error(
       `electron-builder extraResources source missing: ${rel} (npm hoisting changed?)`,
     )
   }
+}
+// harfbuzzjs wasm resolved dynamically above — npm hoisting decides where it lands
+if (!existsSync(pdfHarfbuzzWasm)) {
+  throw new Error(
+    `electron-builder extraResources source missing: ${pdfHarfbuzzWasm} (npm hoisting changed?)`,
+  )
 }
 
 // macOS local-OCR helper (scanned-page text recovery): a swiftc output, not
@@ -282,7 +311,7 @@ const config = {
       to: 'wasm/pdfium.wasm',
     },
     {
-      from: '../pdf/node_modules/harfbuzzjs/hb-subset.wasm',
+      from: pdfHarfbuzzWasm,
       to: 'wasm/hb-subset.wasm',
     },
     // platform system-OCR helpers for scanned-page recovery (each exists only

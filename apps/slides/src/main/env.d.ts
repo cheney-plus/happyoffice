@@ -15,8 +15,8 @@ declare module 'bidi-js' {
   export default function bidiFactory(): BidiApi
 }
 
-/** harfbuzzjs low-level Emscripten factory (deep-path import; the wrapper has a top-level await and cannot go into a CJS bundle) */
-declare module '*/harfbuzzjs/dist/harfbuzz.js' {
+/** harfbuzzjs low-level Emscripten factory (deep-path import, aliased in electron.vite.config.ts to the installed copy; the wrapper has a top-level await and cannot go into a CJS bundle) */
+declare module 'harfbuzzjs/dist/harfbuzz.js' {
   function createHarfBuzz(moduleArg?: Record<string, unknown>): Promise<unknown>
   export default createHarfBuzz
 }
